@@ -1,118 +1,91 @@
 #!/bin/bash
-set -e
+# =====================================================
+# Script de configuración automática para Kea DHCP4
+# Autor: Daren Vejarano (ajustado)
+# Descripción:
+#   Detecta la red del contenedor Docker y genera
+#   el archivo kea-dhcp4.conf dinámicamente.
+# =====================================================
 
-echo "Iniciando instalación automática de Kea DHCP..."
-
-# --- Verificar permisos ---
-if [ "$EUID" -ne 0 ]; then
-  echo "Debes ejecutar este script como root o con sudo."
-  exit 1
-fi
-
-# --- Actualizar e instalar dependencias ---
-apt update -y
-apt install -y kea-dhcp4-server kea-admin iproute2 curl jq
-
-# --- Detectar interfaz principal ---
-echo "Detectando interfaz de red..."
-IFACE=$(ip route | awk '/default/ {print $5; exit}')
+# Detectar la interfaz activa
+IFACE=$(ip route | grep default | awk '{print $5}')
 if [ -z "$IFACE" ]; then
-  echo "No se pudo detectar la interfaz de red."
-  exit 1
+    echo "No se pudo detectar la interfaz de red."
+    exit 1
 fi
 echo "Interfaz detectada: $IFACE"
 
-# --- Obtener IP y subred ---
-IP_INFO=$(ip -4 addr show "$IFACE" | awk '/inet / {print $2; exit}')
+# Detectar IP y máscara
+IP_INFO=$(ip -o -f inet addr show "$IFACE" | awk '{print $4}')
 if [ -z "$IP_INFO" ]; then
-  echo "No se pudo obtener la IP de la interfaz $IFACE"
-  exit 1
+    echo "No se pudo detectar la IP en $IFACE."
+    exit 1
 fi
-echo "IP y subred detectadas: $IP_INFO"
+echo "Dirección IP detectada: $IP_INFO"
 
-# Extraer red base y gateway
-NETWORK=$(ip route | awk '/src/ {print $1; exit}')
-GATEWAY=$(ip route | awk '/default/ {print $3; exit}')
+# Extraer red y máscara
+NETWORK=$(ipcalc -n "$IP_INFO" | awk -F'= ' '/Network/ {print $2}')
+MASK=$(echo "$NETWORK" | cut -d'/' -f2)
+NETWORK_ADDR=$(echo "$NETWORK" | cut -d'/' -f1)
 
-# Si no detecta la red, intenta calcularla
-if [ -z "$NETWORK" ]; then
-  NETWORK=$(ip -4 addr show "$IFACE" | awk '/inet / {print $2; exit}')
-fi
+# Calcular gateway (la primera IP usable)
+IFS=. read -r n1 n2 n3 n4 <<< "$NETWORK_ADDR"
+GATEWAY="$n1.$n2.$n3.$((n4 + 1))"
 
-echo "Subred detectada: $NETWORK"
-echo "Gateway detectado: $GATEWAY"
+# Calcular rango DHCP automáticamente
+# Evita gateway (.1) y broadcast
+block_size=$(( 2 ** (32 - MASK) ))
+POOL_START="$n1.$n2.$n3.$((n4 + 2))"
+POOL_END_OCTET=$((n4 + block_size - 2))
+POOL_END="$n1.$n2.$n3.$POOL_END_OCTET"
 
-# --- Crear directorios ---
-mkdir -p /etc/kea /var/log/kea
-touch /var/log/kea/kea-dhcp4.log
+echo "------------------------------------------"
+echo "Red detectada:      $NETWORK"
+echo "Gateway:            $GATEWAY"
+echo "Rango DHCP:         $POOL_START - $POOL_END"
+echo "------------------------------------------"
 
-# --- Generar archivo de configuración dinámico ---
-echo "Creando configuración /etc/kea/kea-dhcp4.conf..."
-
-# Derivar rango DHCP automáticamente (últimos 100 IPs)
-IFS='./' read -r a b c d mask <<<"${NETWORK//\// }"
-POOL_START="${a}.${b}.${c}.$((d + 100))"
-POOL_END="${a}.${b}.${c}.$((d + 200))"
-
-cat > /etc/kea/kea-dhcp4.conf <<EOF
+# Crear configuración Kea DHCP4
+cat <<EOF > /etc/kea/kea-dhcp4.conf
 {
-    "Dhcp4": {
-        "interfaces-config": {
-            "interfaces": [ "$IFACE" ]
-        },
-        "lease-database": {
-            "type": "memfile",
-            "lfc-interval": 3600
-        },
-        "valid-lifetime": 4000,
-        "renew-timer": 1000,
-        "rebind-timer": 2000,
-        "subnet4": [
-            {
-                "subnet": "$NETWORK",
-                "pools": [ { "pool": "$POOL_START-$POOL_END" } ],
-                "option-data": [
-                    { "name": "routers", "data": "$GATEWAY" },
-                    { "name": "domain-name-servers", "data": "8.8.8.8, 8.8.4.4" }
-                ]
-            }
-        ],
-        "loggers": [
-            {
-                "name": "kea-dhcp4",
-                "output_options": [
-                    {
-                        "output": "/var/log/kea/kea-dhcp4.log",
-                        "maxsize": 1048576,
-                        "maxver": 5
-                    }
-                ],
-                "severity": "INFO"
-            }
+  "Dhcp4": {
+    "interfaces-config": {
+      "interfaces": [ "$IFACE" ]
+    },
+    "lease-database": {
+      "type": "memfile",
+      "lfc-interval": 3600
+    },
+    "valid-lifetime": 4000,
+    "renew-timer": 1000,
+    "rebind-timer": 2000,
+    "subnet4": [
+      {
+        "subnet": "$NETWORK",
+        "pools": [ { "pool": "$POOL_START - $POOL_END" } ],
+        "option-data": [
+          { "name": "routers", "data": "$GATEWAY" },
+          { "name": "domain-name-servers", "data": "8.8.8.8, 8.8.4.4" }
         ]
+      }
+    ],
+    "control-socket": {
+      "socket-type": "unix",
+      "socket-name": "/run/kea/kea4-ctrl-socket"
     }
+  }
 }
 EOF
 
-# --- Permisos ---
-chmod 644 /etc/kea/kea-dhcp4.conf
-chown -R _kea:_kea /etc/kea /var/log/kea
+echo "Archivo /etc/kea/kea-dhcp4.conf generado correctamente."
 
-# --- Habilitar y arrancar servicio ---
-systemctl enable kea-dhcp4-server
+# Reiniciar servicio Kea
 systemctl restart kea-dhcp4-server
 
-sleep 2
-
+# Comprobar estado
 if systemctl is-active --quiet kea-dhcp4-server; then
-  echo "Kea DHCP configurado y ejecutándose correctamente."
+    echo "Kea DHCP4 Server se ha iniciado correctamente."
 else
-  echo "Error al iniciar Kea DHCP. Revisa con:"
-  echo "journalctl -u kea-dhcp4-server -e"
+    echo "Error al iniciar Kea DHCP4 Server. Revisa el log:"
+    journalctl -u kea-dhcp4-server -n 20 --no-pager
 fi
-
-echo
-echo "Archivo de configuración: /etc/kea/kea-dhcp4.conf"
-echo "Logs: /var/log/kea/kea-dhcp4.log"
-echo "Red detectada: $NETWORK"
-echo "Instalación finalizada."
