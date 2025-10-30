@@ -70,7 +70,7 @@ cat > /etc/kea/kea-dhcp4.conf <<EOF
         "subnet4": [
             {
                 "subnet": "$NETWORK",
-                "pools": [ { "pool": "$POOL_START - $POOL_END" } ],
+                "pools": [ { "pool": "$POOL_START-$POOL_END" } ],
                 "option-data": [
                     { "name": "routers", "data": "$GATEWAY" },
                     { "name": "domain-name-servers", "data": "8.8.8.8, 8.8.4.4" }
